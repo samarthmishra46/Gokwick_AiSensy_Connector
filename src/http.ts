@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { ConfigError } from "./config";
 import { log } from "./log";
 
@@ -9,14 +9,38 @@ export function json(data: unknown, status = 200): Response {
   });
 }
 
-/** Constant-time comparison of the `?token=` query param against the expected secret. */
-export function tokenMatches(request: Request, expected: string | undefined): boolean {
-  const given = new URL(request.url).searchParams.get("token");
+/** Constant-time string comparison. Hashing both sides makes the lengths equal. */
+export function safeEqual(given: string | null | undefined, expected: string | undefined): boolean {
   if (!given || !expected) return false;
-  // Hash both sides so timingSafeEqual always compares equal-length buffers.
   const a = createHash("sha256").update(given).digest();
   const b = createHash("sha256").update(expected).digest();
   return timingSafeEqual(a, b);
+}
+
+/** Constant-time comparison of the `?token=` query param against the expected secret. */
+export function tokenMatches(request: Request, expected: string | undefined): boolean {
+  return safeEqual(new URL(request.url).searchParams.get("token"), expected);
+}
+
+/** `Authorization: Bearer <secret>` (what Vercel Cron sends when CRON_SECRET is set). */
+export function bearerMatches(request: Request, expected: string | undefined): boolean {
+  const header = request.headers.get("authorization") ?? "";
+  const m = /^Bearer\s+(.+)$/i.exec(header);
+  return safeEqual(m?.[1]?.trim(), expected);
+}
+
+/**
+ * Shopify webhook signature: base64(HMAC-SHA256(raw body, secret)) in
+ * X-Shopify-Hmac-Sha256. Must be computed over the raw bytes, before JSON parsing.
+ */
+export function shopifyHmacValid(
+  raw: Buffer,
+  header: string | null,
+  secret: string | undefined,
+): boolean {
+  if (!header || !secret) return false;
+  const expected = createHmac("sha256", secret).update(raw).digest("base64");
+  return safeEqual(header.trim(), expected);
 }
 
 export function unauthorized(): Response {

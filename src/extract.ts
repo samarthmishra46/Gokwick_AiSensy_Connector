@@ -88,7 +88,8 @@ const WRAPPER_KEYS = [
 
 const MAX_DEPTH = 6;
 
-export type FieldName = "phone" | "firstName" | "link" | "cartId" | "total" | "itemsSummary";
+export type FieldName =
+  "phone" | "firstName" | "link" | "cartId" | "total" | "itemsSummary" | "eventType";
 export type PickSource = "override" | "candidate" | "deep";
 export interface Picked {
   value: string;
@@ -103,6 +104,8 @@ export interface FieldOverrides {
   link?: string;
   cartId?: string;
   total?: string;
+  /** No built-in guesses: GoKwik doesn't document an event/state field. Set MAP_EVENT_TYPE. */
+  eventType?: string;
 }
 
 export interface CartEntry {
@@ -257,6 +260,7 @@ export function extractFields(cart: unknown, overrides: FieldOverrides = {}): Ex
   out.cartId = resolve(cart, overrides.cartId, f.cartId.paths, f.cartId.deepKeys, acceptScalar);
   out.total = resolve(cart, overrides.total, f.total.paths, f.total.deepKeys, acceptScalar);
   out.itemsSummary = itemsSummary(cart);
+  out.eventType = resolve(cart, overrides.eventType, [], [], acceptScalar);
 
   for (const k of Object.keys(out) as FieldName[]) if (!out[k]) delete out[k];
   return out;

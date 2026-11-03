@@ -1,12 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { captureLogs, mockFetch, post, setEnv } from "./helpers";
 
-vi.mock("@upstash/redis", () => ({
-  Redis: class {
-    set = vi.fn(async () => "OK");
-    del = vi.fn(async () => 1);
-  },
-}));
+vi.mock("@upstash/redis", () => import("./fakeRedis.js"));
 
 import { POST as webhook } from "../api/gokwik/abandoned-cart";
 import { describeShape, maskSample } from "../src/discovery";
@@ -58,6 +53,7 @@ describe("discovery mode", () => {
       received: 1,
       sent: 0,
       skipped: 1,
+      rejected: 0,
       failed: 0,
       mode: "discovery",
     });

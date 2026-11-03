@@ -20,6 +20,9 @@ export function GET(): Response {
         dryRun: cfg.dryRun,
         discoveryMode: cfg.discoveryMode,
         dedupe: cfg.redis ? "redis" : "off",
+        // "on" needs Redis + SHOPIFY_WEBHOOK_SECRET + the Shopify order webhook (README).
+        orderCheck: cfg.redis && cfg.shopifyWebhookSecret ? "on" : "off",
+        retryQueue: cfg.redis ? "redis" : "off",
       },
       ok ? 200 : 500,
     );

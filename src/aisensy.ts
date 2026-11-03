@@ -33,9 +33,14 @@ export interface AiSensyBody {
   paramsFallbackValue: Record<string, string>;
 }
 
+/**
+ * - transient: network error, timeout, 429 or 5xx. Retrying later may work.
+ * - auth: 401/403. The API key is wrong or revoked: retry once the key is fixed.
+ * - permanent: any other rejection (e.g. campaign not Live, param count, bad number).
+ */
 export type SendResult =
-  | { ok: true; status: number }
-  | { ok: false; kind: "transient" | "permanent"; status?: number; reason: string };
+  | { ok: true; status: number; response: string }
+  | { ok: false; kind: "transient" | "auth" | "permanent"; status?: number; reason: string };
 
 /** WhatsApp rejects template params containing newlines, tabs or 4+ consecutive spaces. */
 function cleanParam(v: string): string {
@@ -122,16 +127,39 @@ export async function sendToAiSensy(
     return { ok: false, kind: "transient", reason };
   }
 
+  // AiSensy bodies are short messages; scrub anything phone/email-like anyway.
+  const text = await res.text().catch(() => "");
+  const snippet = scrubEmails(scrubDigits(text.slice(0, 300)));
+
   if (res.ok) {
-    await res.body?.cancel().catch(() => {});
-    return { ok: true, status: res.status };
+    // AiSensy only documents "200 on success". Don't count a 2xx whose body explicitly
+    // says it failed (e.g. {"success":"false",...}) as sent.
+    if (explicitFailure(text)) {
+      return { ok: false, kind: "permanent", status: res.status, reason: snippet };
+    }
+    return { ok: true, status: res.status, response: snippet };
   }
 
-  // AiSensy error bodies are short messages; scrub anything phone/email-like anyway.
-  const text = await res.text().catch(() => "");
-  const reason = scrubEmails(scrubDigits(text.slice(0, 300))) || res.statusText;
-  const transient = res.status === 429 || res.status >= 500;
-  return { ok: false, kind: transient ? "transient" : "permanent", status: res.status, reason };
+  const reason = snippet || res.statusText;
+  const kind =
+    res.status === 401 || res.status === 403
+      ? "auth"
+      : res.status === 429 || res.status >= 500
+        ? "transient"
+        : "permanent";
+  return { ok: false, kind, status: res.status, reason };
+}
+
+function explicitFailure(text: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return false;
+  }
+  if (typeof parsed !== "object" || parsed === null || !("success" in parsed)) return false;
+  const success = (parsed as { success: unknown }).success;
+  return success === false || (typeof success === "string" && success.toLowerCase() === "false");
 }
 
 export function logDryRun(cfg: Config, body: AiSensyBody, fields: Record<string, unknown> = {}) {

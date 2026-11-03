@@ -111,7 +111,15 @@ export function logDiscovery(info: DiscoveryInfo): void {
     });
   }
 
-  const fields = ["phone", "firstName", "link", "cartId", "total", "itemsSummary"] as const;
+  const fields = [
+    "phone",
+    "firstName",
+    "link",
+    "cartId",
+    "total",
+    "itemsSummary",
+    "eventType",
+  ] as const;
   const picked: Record<string, unknown> = {};
   for (const f of fields) {
     const pick = info.extraction[f];

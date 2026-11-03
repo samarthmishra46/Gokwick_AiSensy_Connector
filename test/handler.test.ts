@@ -11,19 +11,8 @@ import {
   WEBHOOK_TOKEN,
 } from "./helpers";
 
-const redisStore = vi.hoisted(() => new Map<string, string>());
-vi.mock("@upstash/redis", () => ({
-  Redis: class {
-    async set(key: string, value: string, opts?: { nx?: boolean }) {
-      if (opts?.nx && redisStore.has(key)) return null;
-      redisStore.set(key, value);
-      return "OK";
-    }
-    async del(key: string) {
-      return redisStore.delete(key) ? 1 : 0;
-    }
-  },
-}));
+vi.mock("@upstash/redis", () => import("./fakeRedis.js"));
+import { redisStore, resetRedis } from "./fakeRedis";
 
 import { GET as webhookGet, POST as webhook } from "../api/gokwik/abandoned-cart";
 import { GET as health } from "../api/health";
@@ -36,7 +25,7 @@ function sentBody(fetchFn: ReturnType<typeof mockFetch>, call = 0) {
 }
 
 beforeEach(() => {
-  redisStore.clear();
+  resetRedis();
   setEnv();
 });
 
@@ -68,7 +57,14 @@ describe("webhook sending", () => {
     const fetchFn = mockFetch();
     const res = await webhook(post(PATH, fakeCart()));
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ received: 1, sent: 1, skipped: 0, failed: 0, mode: "live" });
+    expect(await res.json()).toEqual({
+      received: 1,
+      sent: 1,
+      skipped: 0,
+      rejected: 0,
+      failed: 0,
+      mode: "live",
+    });
 
     expect(fetchFn).toHaveBeenCalledTimes(1);
     expect(fetchFn.mock.calls[0]![0]).toBe(AISENSY_URL);
@@ -173,15 +169,15 @@ describe("webhook sending", () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fetch failed")));
     const res = await webhook(post(PATH, fakeCart()));
     expect(res.status).toBe(500);
-    expect(redisStore.size).toBe(0);
+    expect(redisStore.has("gk:ac:fake-cart-001")).toBe(false);
   });
 
-  it("AiSensy 400 -> skipped with 200, key kept, error scrubbed of phone digits", async () => {
+  it("AiSensy 400 -> rejected (not sent) with 200, key kept, error scrubbed of phone digits", async () => {
     const logs = captureLogs();
     mockFetch(400, '{"message":"Invalid destination +919000000001"}');
     const res = await webhook(post(PATH, fakeCart()));
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ received: 1, sent: 0, skipped: 1, failed: 0 });
+    expect(await res.json()).toMatchObject({ received: 1, sent: 0, rejected: 1, failed: 0 });
     expect(redisStore.has("gk:ac:fake-cart-001")).toBe(true);
     expect(logs.text()).toContain("aisensy_rejected");
     expect(logs.text()).not.toContain("9000000001");
@@ -235,7 +231,13 @@ describe("webhook sending", () => {
     ];
     const res = await webhook(post(PATH, { carts }));
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ received: 3, sent: 1, skipped: 2, failed: 0 });
+    expect(await res.json()).toMatchObject({
+      received: 3,
+      sent: 1,
+      skipped: 1,
+      rejected: 1,
+      failed: 0,
+    });
   });
 
   it("accepts form-encoded bodies", async () => {
@@ -316,6 +318,8 @@ describe("/api/health", () => {
       dryRun: true,
       discoveryMode: true,
       dedupe: "redis",
+      orderCheck: "off",
+      retryQueue: "redis",
     });
     expect(text).not.toContain(API_KEY);
   });
@@ -330,6 +334,8 @@ describe("/api/health", () => {
       dryRun: true,
       discoveryMode: true,
       dedupe: "off",
+      orderCheck: "off",
+      retryQueue: "off",
     });
   });
 });

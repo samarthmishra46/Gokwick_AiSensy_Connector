@@ -2,31 +2,23 @@
  * POST /api/gokwik/abandoned-cart?token=<GOKWIK_WEBHOOK_TOKEN>
  *
  * Receives GoKwik abandoned-cart webhooks and sends each cart to an AiSensy API
- * campaign. Returns 500 only when a retry could help (AiSensy network/5xx/429), so
- * GoKwik retries; dedupe keeps a retry from messaging the same cart twice.
+ * campaign (see src/deliver.ts for the per-cart steps). Returns 500 only when a retry
+ * could help (AiSensy network/5xx/429/auth, Redis down), so GoKwik may retry; failed
+ * sends are also kept in the Redis retry queue for /api/cron/retry-failed. Dedupe keeps
+ * any retry from messaging the same cart twice.
  */
-import { BuildError, buildBody, logDryRun, sendToAiSensy } from "../../src/aisensy";
 import { assertWebhookConfig, loadConfig, type Config } from "../../src/config";
-import { dedupeKey, getDeduper, type Deduper } from "../../src/dedupe";
+import { deliver, type Mode, type Outcome, type Status } from "../../src/deliver";
 import { logDiscovery } from "../../src/discovery";
 import { extractFields, splitCarts, type CartEntry, type Extraction } from "../../src/extract";
 import { handleError, json, readBody, tokenMatches, unauthorized } from "../../src/http";
 import { log } from "../../src/log";
 import { maskPhone, normalizePhone } from "../../src/phone";
+import { dedupeId, getStore, type Store } from "../../src/store";
 
 /** Stay inside Vercel's 10 s maxDuration. */
 const BUDGET_MS = 9_000;
-/** Don't start a new AiSensy call with less time than this left; let GoKwik retry instead. */
-const MIN_SEND_WINDOW_MS = 1_500;
-const AISENSY_TIMEOUT_MS = 8_000;
 const CONCURRENCY = 5;
-
-type Mode = "discovery" | "dry_run" | "live";
-type Status = "sent" | "skipped" | "failed";
-interface Outcome {
-  status: Status;
-  reason: string;
-}
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, i: number) => Promise<R>) {
   const results: R[] = new Array(items.length);
@@ -46,14 +38,16 @@ function pathsOf(ex: Extraction): Record<string, string> {
   return Object.fromEntries(Object.entries(ex).map(([k, p]) => [k, `${p.path} (${p.via})`]));
 }
 
+type Result = Pick<Outcome, "status" | "reason">;
+
 async function processCart(
   cfg: Config,
   mode: Mode,
   entry: CartEntry,
   cartIndex: number,
-  deduper: Deduper | undefined,
+  store: Store | undefined,
   deadline: number,
-): Promise<Outcome> {
+): Promise<Result> {
   const cc = cfg.defaultCountryCode;
   const ex = extractFields(entry.cart, cfg.map);
   const phone = ex.phone ? normalizePhone(ex.phone.value, cc) : undefined;
@@ -71,13 +65,21 @@ async function processCart(
   }
 
   const ctx = { cartIndex, at: entry.at, cartId: ex.cartId?.value, paths: pathsOf(ex) };
-  const done = (status: Status, reason: string, extra: Record<string, unknown> = {}): Outcome => {
+  const done = (status: Status, reason: string, extra: Record<string, unknown> = {}): Result => {
     const fields = { ...ctx, status, reason, ...extra };
-    if (status === "failed") log.error("cart_result", fields);
+    if (status === "failed" || status === "rejected") log.error("cart_result", fields);
     else if (status === "skipped") log.warn("cart_result", fields);
     else log.info("cart_result", fields);
     return { status, reason };
   };
+
+  // Only when configured (MAP_EVENT_TYPE + ALLOWED_EVENT_TYPES): is this an abandoned cart?
+  if (cfg.allowedEventTypes.length) {
+    const type = ex.eventType?.value.toLowerCase();
+    if (!type || !cfg.allowedEventTypes.includes(type)) {
+      return done("skipped", "not_abandoned_event", { eventType: type ?? "(missing)" });
+    }
+  }
 
   if (!ex.phone || !phone) return done("skipped", "missing_phone");
   if (!phone.ok) {
@@ -86,68 +88,39 @@ async function processCart(
       detail: phone.reason,
     });
   }
-  const maskedPhone = maskPhone(phone.digits, cc);
 
   let link = ex.link?.value;
   if (!link) {
+    if (cfg.requireRecoveryLink) {
+      return done("skipped", "missing_recovery_link", { phone: maskPhone(phone.digits, cc) });
+    }
     log.warn("no_recovery_link", { ...ctx, fallback: "STORE_URL" });
     link = cfg.storeUrl;
   }
 
-  let body;
-  try {
-    body = buildBody(cfg, {
-      phone: phone.digits,
-      firstName: ex.firstName?.value,
-      recoveryUrl: link,
-      cartTotal: ex.total?.value,
-      itemsSummary: ex.itemsSummary?.value,
-    });
-  } catch (err) {
-    if (err instanceof BuildError) {
-      return done("skipped", "cannot_build_message", { phone: maskedPhone, detail: err.message });
-    }
-    throw err;
-  }
-
-  if (mode === "dry_run") {
-    logDryRun(cfg, body, { cartIndex });
-    return done("sent", "dry_run", { phone: maskedPhone });
-  }
-
-  if (deadline - Date.now() < MIN_SEND_WINDOW_MS) {
-    return done("failed", "deferred_time_budget", { phone: maskedPhone });
-  }
-
-  const key = dedupeKey(ex.cartId?.value, phone.digits, link);
-  let claimed: boolean;
-  try {
-    claimed = await deduper!.claim(key);
-  } catch (err) {
-    return done("failed", "dedupe_error", {
-      phone: maskedPhone,
-      detail: err instanceof Error ? err.message : "unknown",
-    });
-  }
-  if (!claimed) return done("skipped", "duplicate", { phone: maskedPhone });
-
-  const timeout = Math.min(AISENSY_TIMEOUT_MS, deadline - Date.now() - 500);
-  const res = await sendToAiSensy(cfg, body, timeout);
-  if (res.ok) return done("sent", "aisensy_ok", { phone: maskedPhone, httpStatus: res.status });
-
-  const extra = { phone: maskedPhone, httpStatus: res.status, detail: res.reason };
-  if (res.kind === "transient") {
-    try {
-      await deduper!.release(key);
-    } catch (err) {
-      log.error("dedupe_release_failed", {
-        ...ctx,
-        detail: err instanceof Error ? err.message : "unknown",
-      });
-    }
-    return done("failed", "aisensy_transient_error", extra);
-  }
-  return done("skipped", "aisensy_rejected", extra);
+  const outcome = await deliver(
+    cfg,
+    mode,
+    store!,
+    {
+      recipient: {
+        phone: phone.digits,
+        firstName: ex.firstName?.value,
+        recoveryUrl: link,
+        cartTotal: ex.total?.value,
+        itemsSummary: ex.itemsSummary?.value,
+      },
+      id: dedupeId(ex.cartId?.value, phone.digits, link),
+      cartId: ex.cartId?.value,
+      attempts: 0,
+      firstSeenAt: Date.now(),
+    },
+    deadline,
+  );
+  return done(outcome.status, outcome.reason, {
+    ...outcome.extra,
+    ...(outcome.queued !== undefined && { queuedForRetry: outcome.queued }),
+  });
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -167,10 +140,11 @@ export async function POST(request: Request): Promise<Response> {
     const mode: Mode = cfg.discoveryMode ? "discovery" : cfg.dryRun ? "dry_run" : "live";
     const carts = splitCarts(parsed.body);
     log.info("webhook_received", { mode, carts: carts.length, contentType });
+    if (!carts.length) log.warn("no_carts_in_body", { contentType });
 
-    const deduper = mode === "live" ? getDeduper(cfg) : undefined;
+    const store = mode === "discovery" ? undefined : getStore(cfg);
     const outcomes = await mapLimit(carts, CONCURRENCY, (entry, i) =>
-      processCart(cfg, mode, entry, i, deduper, deadline),
+      processCart(cfg, mode, entry, i, store, deadline),
     );
 
     const count = (s: Status) => outcomes.filter((o) => o.status === s).length;
@@ -178,6 +152,7 @@ export async function POST(request: Request): Promise<Response> {
       received: carts.length,
       sent: count("sent"),
       skipped: count("skipped"),
+      rejected: count("rejected"),
       failed: count("failed"),
       mode,
     };

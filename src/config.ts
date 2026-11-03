@@ -30,7 +30,25 @@ export interface Config {
   testPhone?: string;
   redis?: { url: string; token: string };
   dedupeTtlSeconds: number;
-  map: { phone?: string; name?: string; link?: string; cartId?: string; total?: string };
+  map: {
+    phone?: string;
+    name?: string;
+    link?: string;
+    cartId?: string;
+    total?: string;
+    eventType?: string;
+  };
+  /** Lower-cased values of MAP_EVENT_TYPE that count as an abandoned cart (empty = no filter). */
+  allowedEventTypes: string[];
+  /** Skip carts without a recovery link instead of sending STORE_URL. */
+  requireRecoveryLink: boolean;
+  /** Secret that signs Shopify order webhooks (enables the "already ordered" check). */
+  shopifyWebhookSecret?: string;
+  /** How long a Shopify order suppresses abandoned-cart messages to the same phone. */
+  orderSuppressSeconds: number;
+  /** Vercel Cron's Authorization: Bearer secret for /api/cron/retry-failed. */
+  cronSecret?: string;
+  retryMaxAttempts: number;
 }
 
 export class ConfigError extends Error {
@@ -66,6 +84,13 @@ const ENV_VARS = [
   "MAP_LINK",
   "MAP_CART_ID",
   "MAP_TOTAL",
+  "MAP_EVENT_TYPE",
+  "ALLOWED_EVENT_TYPES",
+  "REQUIRE_RECOVERY_LINK",
+  "SHOPIFY_WEBHOOK_SECRET",
+  "ORDER_SUPPRESS_SECONDS",
+  "CRON_SECRET",
+  "RETRY_MAX_ATTEMPTS",
 ] as const;
 
 const secretToken = z
@@ -133,6 +158,21 @@ const schema = z.object({
   MAP_LINK: z.string().optional(),
   MAP_CART_ID: z.string().optional(),
   MAP_TOTAL: z.string().optional(),
+  MAP_EVENT_TYPE: z.string().optional(),
+  ALLOWED_EVENT_TYPES: z
+    .string()
+    .default("")
+    .transform((v) =>
+      v
+        .split(",")
+        .map((t) => t.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  REQUIRE_RECOVERY_LINK: bool(false),
+  SHOPIFY_WEBHOOK_SECRET: z.string().optional(),
+  ORDER_SUPPRESS_SECONDS: z.coerce.number().int().min(60).max(2_592_000).default(86_400),
+  CRON_SECRET: z.string().min(16, "must be at least 16 characters").optional(),
+  RETRY_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(6),
 });
 
 /** Read and validate env vars. Throws ConfigError (variable names only, never values). */
@@ -159,6 +199,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       "UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN must be set together (or both left empty)",
     ]);
   }
+  if (e.ALLOWED_EVENT_TYPES.length && !e.MAP_EVENT_TYPE) {
+    throw new ConfigError([
+      "ALLOWED_EVENT_TYPES needs MAP_EVENT_TYPE (the field that holds the event type)",
+    ]);
+  }
 
   return {
     gokwikWebhookToken: e.GOKWIK_WEBHOOK_TOKEN,
@@ -183,7 +228,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       link: e.MAP_LINK,
       cartId: e.MAP_CART_ID,
       total: e.MAP_TOTAL,
+      eventType: e.MAP_EVENT_TYPE,
     },
+    allowedEventTypes: e.ALLOWED_EVENT_TYPES,
+    requireRecoveryLink: e.REQUIRE_RECOVERY_LINK,
+    shopifyWebhookSecret: e.SHOPIFY_WEBHOOK_SECRET,
+    orderSuppressSeconds: e.ORDER_SUPPRESS_SECONDS,
+    cronSecret: e.CRON_SECRET,
+    retryMaxAttempts: e.RETRY_MAX_ATTEMPTS,
   };
 }
 

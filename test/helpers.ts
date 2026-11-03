@@ -30,6 +30,13 @@ const BASE_ENV: Record<string, string> = {
   MAP_LINK: "",
   MAP_CART_ID: "",
   MAP_TOTAL: "",
+  MAP_EVENT_TYPE: "",
+  ALLOWED_EVENT_TYPES: "",
+  REQUIRE_RECOVERY_LINK: "",
+  SHOPIFY_WEBHOOK_SECRET: "",
+  ORDER_SUPPRESS_SECONDS: "",
+  CRON_SECRET: "",
+  RETRY_MAX_ATTEMPTS: "",
 };
 
 /** Stub every env var the app reads, so the developer's shell can't leak into tests. */

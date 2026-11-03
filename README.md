@@ -5,13 +5,25 @@ GoKwik checkout but doesn't pay, GoKwik sends the cart to this small web service
 service then sends that shopper your approved WhatsApp template through an **AiSensy API
 Campaign**, with their first name and a link back to their cart.
 
-It runs on Vercel and has three web addresses (endpoints):
+Before sending, it checks that the shopper hasn't already placed an order (via Shopify's
+order webhook), that this cart hasn't been messaged before, and it keeps failed sends for a
+later retry.
 
-| Address                                   | What it's for                                                  |
-| ----------------------------------------- | -------------------------------------------------------------- |
-| `POST /api/gokwik/abandoned-cart?token=…` | GoKwik sends abandoned carts here.                             |
-| `POST /api/test-send?token=…`             | Sends one test WhatsApp to your own number.                    |
-| `GET /api/health`                         | Shows whether the service is up and which safety modes are on. |
+It runs on Vercel and has these web addresses (endpoints):
+
+| Address                                   | What it's for                                                      |
+| ----------------------------------------- | ------------------------------------------------------------------ |
+| `POST /api/gokwik/abandoned-cart?token=…` | GoKwik sends abandoned carts here.                                 |
+| `POST /api/shopify/order-created`         | Shopify tells us about new orders (so buyers aren't messaged).     |
+| `GET /api/cron/retry-failed`              | Resends carts whose AiSensy call failed temporarily (Vercel Cron). |
+| `POST /api/test-send?token=…`             | Sends one test WhatsApp to your own number.                        |
+| `GET /api/health`                         | Shows whether the service is up and which safety modes are on.     |
+
+> **Why the old setup stopped working after moving to GoKwik checkout:** Shopify no longer
+> lets GoKwik create Shopify "abandoned checkouts". Anything that relied on them (Shopify's
+> abandoned-checkout webhook, Shopify abandoned-checkout emails, or AiSensy's Shopify
+> abandoned-cart automation) gets nothing for GoKwik carts. This connector takes GoKwik's own
+> abandoned-cart webhook instead.
 
 It starts in two **safety modes**, and both are on by default:
 
@@ -60,17 +72,19 @@ vercel            # log in, then answer the questions: "Link to existing project
 Then open **Vercel → your project → Settings → Environment Variables** and add the variables
 listed below for the **Production** environment. `.env.example` explains each one.
 
-| Variable                   | What to put                                                                 |
-| -------------------------- | --------------------------------------------------------------------------- |
-| `GOKWIK_WEBHOOK_TOKEN`     | Your GoKwik webhook token (**required**)                                    |
-| `AISENSY_API_KEY`          | AiSensy → Manage → API Key (**required** before going live)                 |
-| `AISENSY_CAMPAIGN_NAME`    | Exact name of your Live API campaign (**required** before going live)       |
-| `ADMIN_TOKEN`              | Your admin token (for the test endpoint)                                    |
-| `TEST_PHONE`               | Your own WhatsApp number, e.g. `98XXXXXXXX`                                 |
-| `DRY_RUN`                  | `true` for now                                                              |
-| `DISCOVERY_MODE`           | `true` for now                                                              |
-| `UPSTASH_REDIS_REST_URL`   | Optional but recommended, see [Duplicate protection](#duplicate-protection) |
-| `UPSTASH_REDIS_REST_TOKEN` | Optional but recommended                                                    |
+| Variable                   | What to put                                                             |
+| -------------------------- | ----------------------------------------------------------------------- |
+| `GOKWIK_WEBHOOK_TOKEN`     | Your GoKwik webhook token (**required**)                                |
+| `AISENSY_API_KEY`          | AiSensy → Manage → API Key (**required** before going live)             |
+| `AISENSY_CAMPAIGN_NAME`    | Exact name of your Live API campaign (**required** before going live)   |
+| `ADMIN_TOKEN`              | Your admin token (for the test endpoint)                                |
+| `TEST_PHONE`               | Your own WhatsApp number, e.g. `98XXXXXXXX`                             |
+| `DRY_RUN`                  | `true` for now                                                          |
+| `DISCOVERY_MODE`           | `true` for now                                                          |
+| `UPSTASH_REDIS_REST_URL`   | Strongly recommended, see [Duplicate protection](#duplicate-protection) |
+| `UPSTASH_REDIS_REST_TOKEN` | Strongly recommended                                                    |
+| `SHOPIFY_WEBHOOK_SECRET`   | For the already-ordered check, see [step 4b](#4b-shopify-order-webhook) |
+| `CRON_SECRET`              | For automatic retries, see [Retry queue](#retry-queue)                  |
 
 Everything else has sensible defaults (store name THE MISSTT, store URL, country code 91, …).
 
@@ -84,8 +98,18 @@ Vercel prints your address, e.g. `https://misstt-abandoned-cart.vercel.app`. Ope
 `https://<your-project>.vercel.app/api/health` in a browser. You should see:
 
 ```json
-{ "ok": true, "dryRun": true, "discoveryMode": true, "dedupe": "off" }
+{
+  "ok": true,
+  "dryRun": true,
+  "discoveryMode": true,
+  "dedupe": "off",
+  "orderCheck": "off",
+  "retryQueue": "off"
+}
 ```
+
+`dedupe`/`retryQueue` turn `"redis"` once Redis is set; `orderCheck` turns `"on"` once Redis
+and `SHOPIFY_WEBHOOK_SECRET` are set.
 
 > **Important:** Vercel only picks up changed environment variables on a **new deployment**.
 > After you change any variable, run `vercel --prod` again (or use **Redeploy** in the Vercel dashboard).
@@ -175,6 +199,28 @@ If you get `"ok":false`, the `error` field contains AiSensy's reason. See
 
 Treat this URL like a password: anyone who has it can send fake carts to the service. If it
 leaks, change `GOKWIK_WEBHOOK_TOKEN` in Vercel, redeploy, and update the URL in GoKwik.
+(GoKwik doesn't document a signature for this webhook, so the secret token in the URL is the
+authentication.)
+
+## 4b. Shopify order webhook
+
+GoKwik orders still arrive in Shopify as normal orders (prepaid and COD). This webhook
+tells the connector who has ordered, so a shopper who abandoned and then bought isn't asked
+to "complete your order". It needs Redis (see [Duplicate protection](#duplicate-protection)).
+
+1. Shopify admin → **Settings → Notifications → Webhooks** → **Create webhook**.
+2. Event **Order creation**, format **JSON**, URL
+   `https://<your-project>.vercel.app/api/shopify/order-created`, latest API version. Save.
+3. Under the webhook list Shopify shows _"Your webhooks will be signed with …"_. Copy that
+   key into `SHOPIFY_WEBHOOK_SECRET` in Vercel and redeploy.
+4. Use **Send test** in Shopify: the Vercel log shows `order_recorded` (or
+   `order_without_phone` for Shopify's sample order). `/api/health` shows `"orderCheck": "on"`.
+
+Each phone on the order (order, customer, billing and shipping phone) is remembered as a
+one-way hash for `ORDER_SUPPRESS_SECONDS` (default 24 h). Abandoned carts from that phone are
+skipped with `reason: order_completed`, including carts waiting in the retry queue.
+
+Limit: the check only knows about orders placed **before** GoKwik sends the abandoned cart.
 
 ---
 
@@ -221,23 +267,31 @@ GoKwik doesn't publish the exact format of its webhook, so check it once with a 
 
 ## 6. Troubleshooting
 
-Each cart produces one `cart_result` log line with a `status` (`sent` / `skipped` / `failed`)
-and a `reason`.
+Each cart produces one `cart_result` log line with a `status` (`sent` / `skipped` /
+`rejected` / `failed`) and a `reason`. On success it also has `httpStatus` and
+`aisensyResponse` (AiSensy's reply, phone digits masked). With Redis, the last result per cart is
+also kept as `gk:status:<cart id>` (no personal data) for 48 h.
 
-| What you see                                                | What it means / what to do                                                                                                                                                                                                                                                                      |
-| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `401 unauthorized`                                          | The `token=` in the URL doesn't match `GOKWIK_WEBHOOK_TOKEN` (or `ADMIN_TOKEN` for test-send). Check for typos or missing characters, and redeploy after changing a variable.                                                                                                                   |
-| `500 "Server misconfigured"`                                | A variable is missing or invalid. Search the logs for `config_invalid`. It names the variable (never its value).                                                                                                                                                                                |
-| `reason: missing_phone`                                     | No phone number found in the cart. Run discovery and set `MAP_PHONE`.                                                                                                                                                                                                                           |
-| `reason: invalid_phone`                                     | The number isn't 10 digits, or 91 + 10 digits, after cleaning (the log shows only the last 4 digits). Usually a typo by the shopper, so nothing to do. If many numbers fail, `MAP_PHONE` may point to the wrong field.                                                                          |
-| `no_recovery_link` warning                                  | No cart link found, so `STORE_URL` was sent instead. Run discovery and set `MAP_LINK`.                                                                                                                                                                                                          |
-| `reason: aisensy_rejected` (status 400/401/403/404)         | AiSensy refused the message; `detail` has their reason. Common causes: campaign not **Live**, wrong `AISENSY_CAMPAIGN_NAME` (must match exactly), wrong API key, number of template params doesn't match `AISENSY_TEMPLATE_PARAMS`, or the number isn't on WhatsApp. These are **not retried**. |
-| `reason: aisensy_transient_error` (status 429/5xx, timeout) | AiSensy was busy or down. The service answers GoKwik with 500 so GoKwik retries later. With duplicate protection on, a retry never double-sends.                                                                                                                                                |
-| `reason: duplicate`                                         | The cart was already messaged in the last 48 h (`DEDUPE_TTL_SECONDS`). This is normal when GoKwik retries.                                                                                                                                                                                      |
-| Customers get two messages                                  | Turn on duplicate protection (Redis, below), and make sure no other abandoned-cart automation (Shopify / AiSensy-Shopify) is also running.                                                                                                                                                      |
-| `reason: deferred_time_budget`                              | GoKwik sent so many carts at once that they didn't fit in one 10 s request. The rest are retried by GoKwik.                                                                                                                                                                                     |
-| `/api/health` shows `"ok": false`                           | Same as "Server misconfigured" above.                                                                                                                                                                                                                                                           |
-| Nothing arrives from GoKwik at all                          | GoKwik can take 24–48 h after saving the webhook, and only sends carts once they're abandoned (Address Added state). Check the URL in GoKwik matches exactly, including `?token=`.                                                                                                              |
+| What you see                                                                                          | What it means / what to do                                                                                                                                                                                                                                                                                                      |
+| ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `401 unauthorized`                                                                                    | The `token=` in the URL doesn't match `GOKWIK_WEBHOOK_TOKEN` (or `ADMIN_TOKEN` for test-send). Check for typos or missing characters, and redeploy after changing a variable.                                                                                                                                                   |
+| `500 "Server misconfigured"`                                                                          | A variable is missing or invalid. Search the logs for `config_invalid`. It names the variable (never its value).                                                                                                                                                                                                                |
+| `reason: missing_phone`                                                                               | No phone number found in the cart. Run discovery and set `MAP_PHONE`.                                                                                                                                                                                                                                                           |
+| `reason: invalid_phone`                                                                               | The number isn't 10 digits, or 91 + 10 digits, after cleaning (the log shows only the last 4 digits). Usually a typo by the shopper, so nothing to do. If many numbers fail, `MAP_PHONE` may point to the wrong field.                                                                                                          |
+| `no_recovery_link` warning                                                                            | No cart link found, so `STORE_URL` was sent instead. Run discovery and set `MAP_LINK`.                                                                                                                                                                                                                                          |
+| `status: rejected`, `reason: aisensy_rejected` (400/404, or a 2xx whose body says `"success": false`) | AiSensy refused the message; `detail` has their reason. Common causes: campaign not **Live**, wrong `AISENSY_CAMPAIGN_NAME` (must match exactly), number of template params doesn't match `AISENSY_TEMPLATE_PARAMS`, or the number isn't on WhatsApp. These are **not retried** and are counted as `rejected`, never as `sent`. |
+| `reason: aisensy_auth_error` (status 401/403)                                                         | Wrong or revoked `AISENSY_API_KEY`. The cart is kept in the retry queue: fix the key, redeploy, and the next retry run sends it.                                                                                                                                                                                                |
+| `reason: aisensy_transient_error` (status 429/5xx, timeout)                                           | AiSensy was busy or down. The cart goes into the retry queue, and the service answers GoKwik with 500 in case GoKwik retries too. With Redis on, retries never double-send.                                                                                                                                                     |
+| `reason: order_completed`                                                                             | The shopper already placed a Shopify order. Working as intended.                                                                                                                                                                                                                                                                |
+| `reason: missing_recovery_link`                                                                       | `REQUIRE_RECOVERY_LINK=true` and the cart had no link. Run discovery and set `MAP_LINK`.                                                                                                                                                                                                                                        |
+| `reason: not_abandoned_event`                                                                         | `ALLOWED_EVENT_TYPES` is set and the cart's `MAP_EVENT_TYPE` value isn't in it.                                                                                                                                                                                                                                                 |
+| `reason: store_error` / `dedupe_error`                                                                | Redis was unreachable. Nothing was sent; the service answered 500 so GoKwik can retry.                                                                                                                                                                                                                                          |
+| `retry_gave_up`                                                                                       | A cart failed `RETRY_MAX_ATTEMPTS` times or is older than 24 h. Check the earlier `cart_result` / `retry_result` lines for the reason.                                                                                                                                                                                          |
+| `reason: duplicate`                                                                                   | The cart was already messaged in the last 48 h (`DEDUPE_TTL_SECONDS`). This is normal when GoKwik retries.                                                                                                                                                                                                                      |
+| Customers get two messages                                                                            | Turn on duplicate protection (Redis, below), and make sure no other abandoned-cart automation (Shopify / AiSensy-Shopify) is also running.                                                                                                                                                                                      |
+| `reason: deferred_time_budget`                                                                        | GoKwik sent so many carts at once that they didn't fit in one 10 s request. The rest go into the retry queue.                                                                                                                                                                                                                   |
+| `/api/health` shows `"ok": false`                                                                     | Same as "Server misconfigured" above.                                                                                                                                                                                                                                                                                           |
+| Nothing arrives from GoKwik at all                                                                    | GoKwik can take 24–48 h after saving the webhook, and only sends carts once they're abandoned (Address Added state). Check the URL in GoKwik matches exactly, including `?token=`.                                                                                                                                              |
 
 ---
 
@@ -251,8 +305,11 @@ and a `reason`.
   numbers in logs show the last 4 digits only (`91XXXXXX1234`), and the AiSensy API key is never logged.
 - **Dry-run logs** (`dry_run_would_send`) do include the shopper's first name and cart link, so
   you can check the message. Don't leave `DRY_RUN=true` running on real traffic longer than you need.
-- Nothing is stored except, when Redis is on, a short-lived "already sent" marker per cart
-  (the cart id, or a one-way hash of phone + link). It expires after 48 h.
+- With Redis on, the service stores: a short-lived "already sent" marker and a status record per
+  cart (the cart id, or a one-way hash of phone + link; 48 h), a one-way hash of each phone
+  that placed a Shopify order (`ORDER_SUPPRESS_SECONDS`), and **only for carts whose send
+  failed**, the phone, first name, cart link and cart summary needed to retry (deleted when
+  sent, or after 24 h at most).
 
 ---
 
@@ -270,7 +327,7 @@ shows `"dedupe": "redis"`.
 How it works:
 
 - Before sending, the service stores `gk:ac:<cart id>` for 48 h. If the key already exists, the cart is skipped as a duplicate.
-- If AiSensy fails temporarily, the key is removed so GoKwik's retry can send.
+- If AiSensy fails temporarily, the key is removed so a retry (ours or GoKwik's) can send.
 - Dry-run and discovery modes never write keys, so testing doesn't block real messages later.
 - Rare edge case: if the function is cut off mid-send (10 s limit), the cart is treated as sent
   and not retried. That trades one possibly missed message for never double-sending.
@@ -309,6 +366,30 @@ checked October 2026:
 - The docs promise a 200 on success and don't document error formats. The service treats 429
   and 5xx (and timeouts/network errors) as temporary, and any other 4xx as permanent.
 
+### Retry queue
+
+GoKwik doesn't document whether it retries failed webhooks, so the service doesn't rely on
+it. When an AiSensy call fails temporarily (network, timeout, 429, 5xx), with an auth error
+(401/403), or doesn't fit in the request's time budget, the cart is saved in Redis and
+`/api/cron/retry-failed` resends it with backoff (5 min, 10 min, 20 min … up to 2 h between tries),
+for up to `RETRY_MAX_ATTEMPTS` (default 6) attempts and at most 24 h. Each retry re-checks
+duplicate protection and the already-ordered marker, and uses the **current** API key and
+campaign settings.
+
+To run it automatically, set `CRON_SECRET` (16+ random characters) and add a cron to
+`vercel.json`:
+
+```json
+"crons": [{ "path": "/api/cron/retry-failed", "schedule": "*/10 * * * *" }]
+```
+
+> Vercel's Hobby plan only allows **daily** crons, and deploying a more frequent schedule
+> fails. On Hobby use `"0 3 * * *"` or call the endpoint from an external scheduler.
+
+You can also run it by hand:
+`curl "https://<your-project>.vercel.app/api/cron/retry-failed?token=<ADMIN_TOKEN>"`. It does
+nothing while `DRY_RUN` or `DISCOVERY_MODE` is on.
+
 ### All settings
 
 See [`.env.example`](.env.example). Empty values count as "not set". Boolean settings accept
@@ -317,8 +398,10 @@ when missing, so the service fails safe.
 
 ### Webhook responses (what GoKwik receives)
 
-- `200 {"received":N,"sent":N,"skipped":N,"failed":0,"mode":"live"}`: done; nothing to retry.
-- `500 {…,"failed":N}`: at least one cart hit a temporary AiSensy problem; GoKwik should retry.
+- `200 {"received":N,"sent":N,"skipped":N,"rejected":N,"failed":0,"mode":"live"}`: done;
+  nothing for GoKwik to retry. `rejected` carts were refused by AiSensy (see the logs).
+- `500 {…,"failed":N}`: at least one cart hit a temporary AiSensy or Redis problem. GoKwik
+  may retry. The cart is also in the retry queue when Redis is on.
 - `400`: the body wasn't JSON or form data.
 - `401`: wrong or missing token.
 
@@ -336,10 +419,11 @@ npm run typecheck   # tsc --noEmit
 npm run format      # prettier
 ```
 
-Layout: `api/` holds the three Vercel Functions (web-standard `Request → Response` handlers,
+Layout: `api/` holds the Vercel Functions (web-standard `Request → Response` handlers,
 Node 22 runtime, `maxDuration` 10 s, region `bom1` Mumbai). `src/` holds the logic:
 `config` (zod env validation), `extract` (field resolver + `FIELD_CONFIG`), `phone`,
-`aisensy`, `dedupe`, `discovery`, `log`, `http`.
+`aisensy`, `deliver` (per-cart send pipeline shared by the webhook and the retry cron),
+`store` (Redis: dedupe, orders, retry queue, status), `discovery`, `log`, `http`.
 
 ### Running locally with `vercel dev`
 
@@ -388,4 +472,5 @@ Wrong token (expect `401`):
 ```bash
 curl -i -X POST "http://localhost:3000/api/gokwik/abandoned-cart?token=wrong" -d '{}'
 ```
+
 # Gokwick_AiSensy_Connector
